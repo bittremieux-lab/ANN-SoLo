@@ -348,7 +348,7 @@ class SpectrumSpectrumMatch:
 
     @property
     def retention_time(self):
-        return self.library_spectrum.retention_time
+        return self.query_spectrum.retention_time
 
     @property
     def charge(self):

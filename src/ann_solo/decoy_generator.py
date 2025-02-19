@@ -9,8 +9,8 @@ from ann_solo.config import config
 
 def _get_similarity(target: str, decoy: str) -> float:
     """
-    Computes the similarity between two strings using the edit distance
-    based on a dynamic programming approach.
+    Computes the similarity between two peptide sequences using 
+    the edit distance based on a dynamic programming approach.
     Parameters
     ----------
     target: str
