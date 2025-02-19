@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import multiprocessing
+import math
 import os
 from typing import Dict
 from typing import Iterator
@@ -16,13 +17,12 @@ import tqdm
 from spectrum_utils.spectrum import MsmsSpectrum
 
 from ann_solo import reader
-from ann_solo import spectrum_match
 from ann_solo import utils
 from ann_solo.config import config
 from ann_solo.spectrum import process_spectrum
 from ann_solo.spectrum import spectrum_to_vector
 from ann_solo.spectrum import SpectrumSpectrumMatch
-
+from ann_solo.spectrum_match import modified_cosine
 
 class SpectralLibrary:
     """
@@ -60,6 +60,7 @@ class SpectralLibrary:
         FileNotFoundError: The given spectral library file wasn't found or
             isn't supported.
         """
+        # Library Store
         try:
             self._library_reader = reader.SpectralLibraryReader(
                 filename, self._get_hyperparameter_hash())
@@ -115,6 +116,8 @@ class SpectralLibrary:
             if create_ann_charges:
                 self._create_ann_indexes(create_ann_charges)
 
+
+
     def _get_hyperparameter_hash(self) -> str:
         """
         Get a unique string representation of the hyperparameters used to
@@ -144,34 +147,53 @@ class SpectralLibrary:
         # Collect vectors for all spectra per charge.
         charge_vectors = {
             charge: np.zeros((len(self._library_reader.spec_info
-                                  ['charge'][charge]['id']), config.hash_len),
+                                  ['charge'][charge]['id']), config.hash_len * 2),
                              np.float32)
             for charge in charges}
+        # Max batch size to pull data in batches during index creation
+        batch_size = 100000
+        for charge in tqdm.tqdm(charge_vectors.keys(),
+                                desc='Library charge processed', leave=False,
+                                unit='charge',
+                                smoothing=0.1):
+            logging.info(
+                'Fetch spectra projections for charge - %d',
+                charge)
 
-        i = {charge: 0 for charge in charge_vectors.keys()}
-        for lib_spectrum in tqdm.tqdm(
-                self._library_reader.read_all_spectra(),
-                desc='Library spectra added', leave=False, unit='spectra',
-                smoothing=0.1):
-            charge = lib_spectrum.precursor_charge
-            if charge in charge_vectors.keys():
-                spectrum_to_vector(process_spectrum(lib_spectrum, True),
-                                   config.min_mz, config.max_mz,
-                                   config.bin_size, config.hash_len, True,
-                                   charge_vectors[charge][i[charge]])
-                i[charge] += 1
+            # Get the IDs for the current charge
+            charge_ids = self._library_reader.spec_info['charge'][charge]['id']
+            total_ids = len(charge_ids)
+            # Calculate the number of batches
+            num_batches = math.ceil(total_ids / batch_size)
+
+            for batch_idx in tqdm.tqdm(range(num_batches),
+                                       desc=f'Processing batches for charge {charge}',
+                                       leave=False, unit='batch',
+                                       total=num_batches,
+                                       smoothing=0.1):
+                # Determine the start and end of the current batch
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, total_ids)
+                # Fetch the spectra projections for the current batch
+                batch_ids = charge_ids[start_idx:end_idx]
+                spectra_projection = self._library_reader.read_spectra_projections(
+                    batch_ids, charge)
+                # Insert the batch projections
+                charge_vectors[charge][start_idx:end_idx,
+                :] = spectra_projection
+
         # Build an individual FAISS index per charge.
         logging.info('Build the spectral library ANN indexes')
         for charge, vectors in charge_vectors.items():
             logging.debug('Create a new ANN index for charge %d', charge)
-            quantizer = faiss.IndexFlatIP(config.hash_len)
+            quantizer = faiss.IndexFlatIP(config.hash_len*2)
             # TODO: Use HNSW as quantizer?
             #       https://github.com/facebookresearch/faiss/blob/master/benchs/bench_hnsw.py#L136
             # quantizer = faiss.IndexHNSWFlat(config.hash_len, 32)
             # quantizer.hnsw.efSearch = 64
             # ann_index -> faiss.METRIC_L2
             # ann_index.quantizer_trains_alone = 2
-            ann_index = faiss.IndexIVFFlat(quantizer, config.hash_len,
+            ann_index = faiss.IndexIVFFlat(quantizer, config.hash_len*2,
                                            config.num_list,
                                            faiss.METRIC_INNER_PRODUCT)
             # noinspection PyArgumentList
@@ -186,7 +208,7 @@ class SpectralLibrary:
         """
         Release any resources to gracefully shut down.
         """
-        self._library_reader.close()
+        #self._library_reader.close()
         if self._current_index[1] is not None:
             self._current_index[1].reset()
 
@@ -220,12 +242,14 @@ class SpectralLibrary:
                 query_spectra_charge = []
                 for charge in (2, 3):
                     query_spectra_charge.append(copy.copy(query_spectrum))
-                    query_spectra_charge[-1].precursor_charge = charge
+                    query_spectra_charge[-1].precursor_charge(charge)
+
             for query_spectrum_charge in query_spectra_charge:
                 # Discard low-quality spectra.
-                if process_spectrum(query_spectrum_charge, False).is_valid:
-                    (query_spectra[query_spectrum_charge.precursor_charge]
-                     .append(query_spectrum_charge))
+                processed_query = process_spectrum(query_spectrum_charge, False)
+                if processed_query.is_valid:
+                    query_spectra[processed_query.precursor_charge].append(
+                        processed_query)
         # Identify all query spectra.
         identifications = {}
         do_cascade_open = (
@@ -240,6 +264,7 @@ class SpectralLibrary:
             if not do_cascade_open or ssm.q < config.fdr:
                 identifications[ssm.query_identifier] = ssm
                 n_spectra_identified += ssm.q < config.fdr
+
         logging.info('%d spectra identified after the standard search',
                      n_spectra_identified)
         if do_cascade_open:
@@ -256,7 +281,6 @@ class SpectralLibrary:
                 n_spectra_identified += ssm.q < config.fdr
             logging.info('%d spectra identified after the open search',
                          n_spectra_identified)
-
         return list(identifications.values())
 
     def _search_cascade(self, query_spectra: Dict[int, List[MsmsSpectrum]],
@@ -318,6 +342,7 @@ class SpectralLibrary:
         # Store the SSMs below the FDR threshold.
         logging.info('Filter the spectrum—spectrum matches on FDR '
                      '(threshold = %s)', config.fdr)
+
         return utils.score_ssms(
             list(ssms.values()),
             config.fdr,
@@ -351,23 +376,61 @@ class SpectralLibrary:
             that could be successfully matched to its most similar library
             spectrum.
         """
+
         # Find all library candidates for each query spectrum.
         for query_spectrum, library_candidates in zip(
                 query_spectra, self._get_library_candidates(
                     query_spectra, charge, mode)):
             # Find the best match candidate.
             if library_candidates:
-                library_match, _, peak_matches = \
-                    spectrum_match.get_best_match(
+                library_match, score, peak_matches = \
+                    self._get_best_match(
                         query_spectrum, library_candidates,
-                        config.fragment_mz_tolerance,
-                        config.allow_peak_shifts
+                        config.fragment_mz_tolerance
                     )
                 yield SpectrumSpectrumMatch(
                     query_spectrum,
                     library_match,
                     peak_matches=np.asarray(peak_matches),
+                    search_engine_score=score
                 )
+
+
+    def _get_best_match(self, query: MsmsSpectrum, candidates: list[
+                        MsmsSpectrum], fragment_mz: float):
+        """
+        Find the best matching spectrum from a list of candidates using the
+        modified cosine similarity.
+
+        Parameters
+        ----------
+        query: MsmsSpectrum
+            The query spectrum for which the best match is sought.
+        candidates: list[MsmsSpectrum]
+            A list of candidate spectra to compare against the query.
+        fragment_mz: float
+            Search fragment m/z tolerance for comparison.
+
+        Returns:
+            tuple: A tuple containing:
+                - best_match: The spectrum from the candidates with the highest similarity score.
+                - best_score: The highest cosine similarity score among the candidates.
+                - peak_matches: A list of matched peak indices between the query and the best match.
+        """	
+        best_match, best_score, peak_matches = None, None, None
+        for idx, candidate in enumerate(candidates):
+            result = modified_cosine(query, candidate, fragment_mz)
+            if best_match is None or result.score > best_score or (
+                    result.score == best_score and best_match.is_decoy
+            ):
+                best_match = candidate
+                best_score = result.score
+                peak_matches = [[i, j] for i, j in zip(result.matched_indices,
+                                                       result.matched_indices_other)]
+
+        return best_match, best_score, peak_matches
+
+
 
     def _get_library_candidates(self, query_spectra: List[MsmsSpectrum],
                                 charge: int, mode: str)\
@@ -432,27 +495,30 @@ class SpectralLibrary:
         if (config.mode == 'ann' and mode == 'open' and
                 charge in self._ann_filenames):
             ann_index = self._get_ann_index(charge)
-            query_vectors = np.zeros((len(query_spectra), config.hash_len),
+            query_vectors = np.zeros((len(query_spectra), config.hash_len*2),
                                      np.float32)
             for i, query_spectrum in enumerate(query_spectra):
-                spectrum_to_vector(
-                    query_spectrum, config.min_mz, config.max_mz,
-                    config.bin_size, config.hash_len, True, query_vectors[i])
+                query_vectors[i] = spectrum_to_vector(
+                    query_spectrum,
+                    config.min_mz,
+                    config.max_mz,
+                    config.bin_size,
+                    config.hash_len
+                )
             mask = np.zeros_like(candidate_filters)
-            # noinspection PyArgumentList
+
             for mask_i, ann_filter in zip(mask, ann_index.search(
                     query_vectors, self._num_candidates)[1]):
-                mask_i[ann_filter[ann_filter != -1]] = True
+                valid_indices = ann_filter[ann_filter != -1]
+                mask_i[valid_indices] = True
+
             candidate_filters = np.logical_and(candidate_filters, mask)
 
         # Get the library candidates that pass the filter.
         for candidate_filter in candidate_filters:
-            query_candidates = []
-            for idx in library_candidates['id'][candidate_filter]:
-                candidate = self._library_reader.read_spectrum(idx, True)
-                if candidate.is_valid:
-                    query_candidates.append(candidate)
-            yield query_candidates
+            yield self._library_reader.read_spectra_candidates(
+                library_candidates['id'][candidate_filter], charge)
+
 
     def _get_ann_index(self, charge: int) -> faiss.IndexIVF:
         """

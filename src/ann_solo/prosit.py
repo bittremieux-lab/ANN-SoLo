@@ -1,6 +1,8 @@
 from typing import Dict, List
 
+import logging
 import numpy as np
+import pandas as pd
 import tqdm
 from koinapy import Koina
 
@@ -33,7 +35,8 @@ def get_predictions(peptides: List[str], precursor_charges: List[int],
 
     batch_size = config.prosit_batch_size
     len_inputs = len(peptides)
-
+    model = Koina(config.prosit_model_name, config.prosit_server_url)
+    max_retries = 3  # Number of retries for the server call
     for i in tqdm.tqdm(range(0, len_inputs, batch_size),
             desc='Prosit peptides batch prediction:',
             unit=('decoy' if decoy else 'target') + ' peptides'):
@@ -46,8 +49,18 @@ def get_predictions(peptides: List[str], precursor_charges: List[int],
             }
         )
 
-        model = Koina(config.prosit_model_name, config.prosit_server_url)
-        koina_predictions = model.predict(inputs)
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                koina_predictions = model.predict(inputs, debug=True)
+                break  # If successful, exit the retry loop
+            except Exception as e:
+                attempt += 1
+                if attempt == max_retries:
+                    raise RuntimeError(f"Failed to get predictions after {max_retries} retries.") from e
+                logging.info(
+                    f"Retrying prediction (attempt {attempt}/{max_retries}) due to error: {e}")
+
 
         grouped_predictions = koina_predictions.groupby(
             ['peptide_sequences', 'precursor_charges', 'collision_energies']

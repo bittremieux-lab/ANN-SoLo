@@ -46,11 +46,6 @@ compile_args = ['-O3', '-march=native', '-ffast-math', '-fno-associative-math',
                 '-std=c++14']
 cython_directives = {'boundscheck': False, 'wraparound': False,
                      'initializedcheck': False, 'language_level': 3}
-ext_spectrum_match = setuptools.Extension(
-    'ann_solo.spectrum_match',
-    ['ann_solo/spectrum_match.pyx', 'ann_solo/SpectrumMatch.cpp'],
-    language='c++', extra_compile_args=compile_args,
-    extra_link_args=compile_args, include_dirs=[np.get_include()])
 ext_spectrum_match.cython_directives = cython_directives
 ext_parsers = setuptools.Extension(
     'ann_solo.parsers', ['ann_solo/parsers.pyx'],
@@ -83,9 +78,7 @@ setuptools.setup(
         'Programming Language :: C++',
         'Programming Language :: Cython',
         'Programming Language :: Python',
-        'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.6',
-        'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3 :: Only',
         'Topic :: Scientific/Engineering :: Bio-Informatics'],
     packages=['ann_solo'],
@@ -107,7 +100,7 @@ setuptools.setup(
         'pandas',
         'pyteomics',
         'scipy',
-        'spectrum_utils>=0.3.0, <0.4a0',
+        'spectrum_utils>=0..0, <0.4a0',
         'tqdm'],
     setup_requires=[
         'Cython',

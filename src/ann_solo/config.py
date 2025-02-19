@@ -1,8 +1,12 @@
 import argparse
+import os
 import textwrap
 
 import configargparse
 
+# Note that the LANCE_BYPASS_SPILLING environment variable can be used to
+# bypass spilling to disk. Setting this to true can avoid memory exhaustion issues.
+os.environ["LANCE_BYPASS_SPILLING"] = "true"
 
 class NewlineTextHelpFormatter(argparse.HelpFormatter):
 
@@ -179,6 +183,10 @@ class Config:
         self._parser.add_argument(
             '--bin_size', default=0.04, type=float,
             help='ANN vector bin width (default: %(default)s Da)')
+        # ANN vector length after gaussian random projection.
+        self._parser.add_argument(
+            '--low_dim', default=400, type=int,
+            help='ANN vector length (default: %(default)s)')
         # ANN vector length after hashing.
         self._parser.add_argument(
             '--hash_len', default=800, type=int,
@@ -221,7 +229,7 @@ class Config:
             help="generate decoys of the spectral library ")
 
         self._parser.add_argument(
-            '--fragment_tol_mode', type=str, choices=['Da', 'ppm'], default='ppm',
+            '--fragment_tol_mode', type=str, choices=['Da', 'ppm'], default='Da',
             help='Fragment mass tolerance unit. Either (options: %(choices)s)')
 
         # Prosit
