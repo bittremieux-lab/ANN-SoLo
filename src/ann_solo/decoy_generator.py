@@ -1,7 +1,7 @@
 from typing import List, Tuple, Dict
 
-from numba import njit
 import numpy as np
+from numba import njit
 from spectrum_utils import fragment_annotation, proforma
 from spectrum_utils.spectrum import MsmsSpectrum
 
