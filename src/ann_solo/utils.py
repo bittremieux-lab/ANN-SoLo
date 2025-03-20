@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Dict, Iterator, List, Optional, Union
 
 import mokapot
 import numpy as np
 import pandas as pd
-import re
 import scipy.signal
 from sklearn.base import BaseEstimator
 from sklearn.ensemble import RandomForestClassifier

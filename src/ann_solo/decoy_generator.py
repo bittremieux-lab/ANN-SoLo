@@ -1,12 +1,13 @@
 from typing import List, Tuple, Dict
 
+from numba import njit
 import numpy as np
 from spectrum_utils import fragment_annotation, proforma
 from spectrum_utils.spectrum import MsmsSpectrum
 
 from ann_solo.config import config
 
-
+@njit
 def _get_similarity(target: str, decoy: str) -> float:
     """
     Computes the similarity between two peptide sequences using 
@@ -27,8 +28,8 @@ def _get_similarity(target: str, decoy: str) -> float:
     m, n = len(target), len(decoy)
 
     # Init for dynamic programming
-    previous_row = list(range(n + 1))
-    current_row = [0] * (n + 1)
+    previous_row = np.arange(n + 1, dtype=np.int32)
+    current_row = np.zeros(n + 1, dtype=np.int32)
 
     for i in range(1, m + 1):
         current_row[0] = i
@@ -41,13 +42,11 @@ def _get_similarity(target: str, decoy: str) -> float:
                                          previous_row[j - 1]) # Substitution
         previous_row, current_row = current_row, previous_row
 
-    # Get the edit distance
+    # Get the edit distance and compute similarity
     edit_distance = previous_row[n]
-    # Compute similarity
     max_length = max(m, n)
-    similarity = 1 - (edit_distance / max_length) if max_length > 0 else 1.0
 
-    return similarity
+    return 1 - (edit_distance / max_length) if max_length > 0 else 1.0
 
 def _shuffle(peptide_sequence: str, excluded_residues: List[str] =['K', 'R', 'P'],
              max_similarity: float = 0.7) -> Tuple[str, Dict[int, int]]:
@@ -93,7 +92,7 @@ def _shuffle(peptide_sequence: str, excluded_residues: List[str] =['K', 'R', 'P'
         seq_shuffled = seq_shuffled[full_permutation]
         # Compute the similarity between seq_shuffled and seq_original using
         #  edit distance
-        similarity = _get_similarity(seq_original, seq_shuffled.tolist())
+        similarity = _get_similarity(''.join(seq_original), ''.join(seq_shuffled))
         # Check if similarity is below the specified threshold
         if similarity <= max_similarity:
             return ''.join(seq_shuffled), {full_permutation[i]:i  for i in

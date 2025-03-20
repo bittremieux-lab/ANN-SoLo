@@ -3,8 +3,8 @@ import copy
 import hashlib
 import json
 import logging
-import multiprocessing
 import math
+import multiprocessing
 import os
 from typing import Dict
 from typing import Iterator
@@ -147,7 +147,7 @@ class SpectralLibrary:
         # Collect vectors for all spectra per charge.
         charge_vectors = {
             charge: np.zeros((len(self._library_reader.spec_info
-                                  ['charge'][charge]['id']), config.hash_len * 2),
+                                  ['charge'][charge]['id']), config.hash_len),
                              np.float32)
             for charge in charges}
         # Max batch size to pull data in batches during index creation
@@ -186,14 +186,14 @@ class SpectralLibrary:
         logging.info('Build the spectral library ANN indexes')
         for charge, vectors in charge_vectors.items():
             logging.debug('Create a new ANN index for charge %d', charge)
-            quantizer = faiss.IndexFlatIP(config.hash_len*2)
+            quantizer = faiss.IndexFlatIP(config.hash_len)
             # TODO: Use HNSW as quantizer?
             #       https://github.com/facebookresearch/faiss/blob/master/benchs/bench_hnsw.py#L136
             # quantizer = faiss.IndexHNSWFlat(config.hash_len, 32)
             # quantizer.hnsw.efSearch = 64
             # ann_index -> faiss.METRIC_L2
             # ann_index.quantizer_trains_alone = 2
-            ann_index = faiss.IndexIVFFlat(quantizer, config.hash_len*2,
+            ann_index = faiss.IndexIVFFlat(quantizer, config.hash_len,
                                            config.num_list,
                                            faiss.METRIC_INNER_PRODUCT)
             # noinspection PyArgumentList
@@ -208,7 +208,6 @@ class SpectralLibrary:
         """
         Release any resources to gracefully shut down.
         """
-        #self._library_reader.close()
         if self._current_index[1] is not None:
             self._current_index[1].reset()
 
@@ -236,13 +235,15 @@ class SpectralLibrary:
                 reader.read_query_file(query_filename), desc='Query spectra '
                     'read',leave=False, unit='spectra', smoothing=0.7):
             # For queries with an unknown charge, try all possible charges.
-            if query_spectrum.precursor_charge is not None:
+            if query_spectrum.precursor_charge != 0:
                 query_spectra_charge = [query_spectrum]
             else:
                 query_spectra_charge = []
                 for charge in (2, 3):
                     query_spectra_charge.append(copy.copy(query_spectrum))
-                    query_spectra_charge[-1].precursor_charge(charge)
+                    query_spectra_charge[-1]._inner.precursor_charge = charge
+                    query_spectra_charge[-1].is_processed = False
+                    query_spectra_charge[-1].index = query_spectrum.index
 
             for query_spectrum_charge in query_spectra_charge:
                 # Discard low-quality spectra.
@@ -495,7 +496,7 @@ class SpectralLibrary:
         if (config.mode == 'ann' and mode == 'open' and
                 charge in self._ann_filenames):
             ann_index = self._get_ann_index(charge)
-            query_vectors = np.zeros((len(query_spectra), config.hash_len*2),
+            query_vectors = np.zeros((len(query_spectra), config.hash_len),
                                      np.float32)
             for i, query_spectrum in enumerate(query_spectra):
                 query_vectors[i] = spectrum_to_vector(
@@ -503,7 +504,7 @@ class SpectralLibrary:
                     config.min_mz,
                     config.max_mz,
                     config.bin_size,
-                    config.hash_len
+                    int(config.hash_len / 2)
                 )
             mask = np.zeros_like(candidate_filters)
 

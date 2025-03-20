@@ -155,7 +155,6 @@ class SpectralLibraryReader:
             'mz': spectrum.mz,
             'intensity': spectrum.intensity,
             'annotation': spectrum.annotation,
-            #[str(ann) for ann in spectrum.annotation],
             'is_decoy': spectrum.is_decoy,
             'projection': spectrum.projection
         }
@@ -178,17 +177,28 @@ class SpectralLibraryReader:
         # Read all the spectra in the spectral library.
         temp_info = collections.defaultdict(
             lambda: {'id': [], 'precursor_mz': []})
+        # Block to store all spectra peptides if add_decoys parameter is
+        # set to True
+        target_peptides = set()
+        if config.add_decoys and not self._filename_ext == '.fasta':
+            with self as lib_reader:
+                logging.info(
+                    'Read all target peptides in the library first to avoid '
+                    'similar generated decoys.')
+                for spectrum in tqdm.tqdm(
+                        lib_reader.read_library_file(),
+                        desc='Library spectra read', unit='spectra'):
+                    target_peptides.add(spectrum.peptide)
+        # Process the input library
         with self as lib_reader:
             spectra_store = SpectralLibraryStore(self._get_store_filename())
             spectra_store.open_store("w")
             batch = []
             batch_cnt = 0 # For bulk insert
-            target_peptides = set()
             for spectrum in tqdm.tqdm(
                     lib_reader.read_library_file(),
                     desc='Library spectra read', unit='spectra'):
                 if config.add_decoys and not self._filename_ext == '.fasta':
-                    target_peptides.add(spectrum.peptide)
                     # Compute decoy
                     decoy_spectrum = shuffle_and_reposition(spectrum)
                     if decoy_spectrum and decoy_spectrum.peptide not in \
@@ -208,7 +218,7 @@ class SpectralLibraryReader:
                                 config.min_mz,
                                 config.max_mz,
                                 config.bin_size,
-                                config.hash_len
+                                int(config.hash_len / 2)
                             )
                             # Append for bulk insert
                             batch.append(self._spectrum_to_dict(decoy_spectrum))
@@ -227,7 +237,7 @@ class SpectralLibraryReader:
                         config.min_mz,
                         config.max_mz,
                         config.bin_size,
-                        config.hash_len
+                        int(config.hash_len / 2)
                     )
                     # Append for bulk insert
                     batch.append(self._spectrum_to_dict(spectrum))
@@ -333,9 +343,7 @@ class SpectralLibraryReader:
         # Create a temporary dataframe with "id" and "projection" columns
         # Initialize "projection" with numpy arrays of zeros
         temp_dataframe = pd.DataFrame({
-            "id": spec_ids,
-            "projection": [np.zeros(config.hash_len * 2, dtype=np.float32)]
-                          * len(spec_ids)
+            "id": spec_ids
         })
         # Assuming queried_spectra is a pandas DataFrame with "identifier" and "projection" columns
         # Perform a left join to ensure missing identifiers are filled with
@@ -347,8 +355,8 @@ class SpectralLibraryReader:
             how="left"
         )
         # Replace NaN projections with the zero-initialized values
-        merged_df["projection"] = merged_df["projection_y"].combine_first(
-            merged_df["projection_x"])
+        zero_vector = np.zeros(config.hash_len, dtype=np.float32)
+        merged_df["projection"] = merged_df["projection"].where(merged_df["projection"].notna(), zero_vector)
 
         # Return projections as a list of numpy arrays
         return merged_df["projection"].tolist()
@@ -602,8 +610,7 @@ class SpectralLibraryStore:
             An iterator yielding the unique identifiers of spectra
             stored in the library.
         """
-        for spec_id in self.store.to_arrow()["item"].to_pylist():
-            yield spec_id
+        yield from self.store.to_arrow()["item"].to_pylist()
 
     def write_spectrum_to_library(self, spectrum : MsmsSpectrum) -> None:
         """
@@ -857,7 +864,7 @@ def _parse_spectrum_mzml(spectrum_dict: Dict) -> MsmsSpectrum:
     elif 'possible charge state' in precursor_ion:
         precursor_charge = int(precursor_ion['possible charge state'])
     else:
-        precursor_charge = None
+        precursor_charge = 0
     spectrum = MsmsSpectrum(str(scan_nr), precursor_mz, precursor_charge,
                             mz_array, intensity_array, None, retention_time)
 
@@ -927,7 +934,7 @@ def _parse_spectrum_mzxml(spectrum_dict: Dict) -> MsmsSpectrum:
     if 'precursorCharge' in spectrum_dict['precursorMz'][0]:
         precursor_charge = spectrum_dict['precursorMz'][0]['precursorCharge']
     else:
-        precursor_charge = None
+        precursor_charge = 0
 
     spectrum = MsmsSpectrum(str(scan_nr), precursor_mz, precursor_charge,
                             mz_array, intensity_array, None, retention_time)
@@ -1016,7 +1023,7 @@ def read_mgf(filename: str) -> Iterator[MsmsSpectrum]:
             if 'charge' in mgf_spectrum['params']:
                 precursor_charge = int(mgf_spectrum['params']['charge'][0])
             else:
-                precursor_charge = 2#None2
+                precursor_charge = 0
 
             spectrum = MsmsSpectrum(identifier, precursor_mz, precursor_charge,
                                     mgf_spectrum['m/z array'],
@@ -1088,30 +1095,20 @@ def read_fasta(filename: str) -> Iterator[MsmsSpectrum]:
             for protein in proteins
         ]
     )
+    logging.info(
+        'Number of target peptides identified in  the sequence database is = '
+        '%d',
+        len(_peptides))
     ## Discard peptides with unknown residues
-    valid_residues = set(['K',
-                        'L',
-                        'Y',
-                        'A',
-                        'G',
-                        'I',
-                        'E',
-                        'V',
-                        'C',
-                        'M',
-                        'W',
-                        'D',   
-                        'P',
-                        'N',   
-                        'F',
-                        'R',
-                        'S',
-                        'H', 
-                        'Q',
-                        'T'])
+    valid_residues = set("KLYAGIEVCMWDPNFRSHQT")
     _peptides = [
-        peptide for peptide in _peptides if set(peptide).issubset(valid_residues)
+        peptide for peptide in _peptides if all(p in valid_residues for p in peptide)
     ]
+    logging.info(
+        'Number of target peptides kept after discarding peptides with '
+        'unknown '
+        'residues is = %d',
+        len(_peptides))
     ## Initialize lists to pass to Prosit
     _peptides_size = len(_peptides)
     peptides = []
@@ -1146,9 +1143,8 @@ def read_fasta(filename: str) -> Iterator[MsmsSpectrum]:
 
     ## Generate predictions for decoy peptides
     decoy_peptides, decoy_precursor_charges, decoy_collision_energies = [], [], []
-    target_peptides = set() # Set for O(1) of check of existing target peptide
+    target_peptides = set(peptides) # Set for O(1) of check of existing target peptide
     for peptide, charge, col_energie in zip(peptides, precursor_charges, collision_energies):
-        target_peptides.add(peptide)
         decoy_peptide = _shuffle(peptide)[0]
         if decoy_peptide and decoy_peptide not in target_peptides:
             decoy_peptides.append(decoy_peptide)

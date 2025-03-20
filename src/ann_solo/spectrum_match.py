@@ -17,10 +17,6 @@ SimilarityTuple = collections.namedtuple(
     "SimilarityTuple",
     [
         "score",
-        "matched_intensity",
-        "max_contribution",
-        "n_greq_2p",  # signals contributing >= 2% score
-        "matches",  # number of matches
         "matched_indices",
         "matched_indices_other",
     ],
@@ -242,31 +238,16 @@ def _cosine_fast(
         )
 
     score = 0.0
-    matched_intensity = 0.0
-    max_contribution = 0.0
-    # Signals with contribution to cosine score greater 2%.
-    n_greq_2p = 0
-
     row_mask = np.zeros_like(row_ind, np.bool_)
     col_mask = np.zeros_like(col_ind, np.bool_)
     for (i, row), (j, col) in zip(enumerate(row_ind), enumerate(col_ind)):
         pair_score = cost_matrix[row, col]
         if pair_score > 0.0:
             score += pair_score
-            matched_intensity += (
-                spec.intensity[row] + spec_other.intensity[col]
-            )
             row_mask[i] = col_mask[j] = True
-            n_greq_2p += pair_score >= 0.02
-            max_contribution = max(max_contribution, pair_score)
-    matched_intensity /= spec.intensity.sum() + spec_other.intensity.sum()
 
     return SimilarityTuple(
         score,
-        matched_intensity,
-        max_contribution,
-        n_greq_2p,
-        row_mask.sum(),
         row_ind[row_mask],
         col_ind[col_mask],
     )
