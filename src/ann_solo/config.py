@@ -1,12 +1,7 @@
 import argparse
-import os
 import textwrap
 
 import configargparse
-
-# Note that the LANCE_BYPASS_SPILLING environment variable can be used to
-# bypass spilling to disk. Setting this to true can avoid memory exhaustion issues.
-os.environ["LANCE_BYPASS_SPILLING"] = "true"
 
 class NewlineTextHelpFormatter(argparse.HelpFormatter):
 
