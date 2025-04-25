@@ -1,12 +1,11 @@
 import functools
 import math
-from typing import List, Optional
+from typing import Optional
 
 import mmh3
 import numba as nb
 import numpy as np
 from spectrum_utils.spectrum import MsmsSpectrum
-
 from ann_solo.config import config
 
 
@@ -109,7 +108,7 @@ def process_spectrum(spectrum: MsmsSpectrum, is_library: bool) -> MsmsSpectrum:
             scaling, max_rank=(config.max_peaks_used_library if is_library else
                                config.max_peaks_used))
 
-    spectrum._intensity = _norm_intensity(spectrum.intensity)
+    spectrum._inner._intensity = _norm_intensity(spectrum.intensity)
 
     # Set a flag to indicate that the spectrum has been processed to avoid
     # reprocessing of library spectra for multiple queries.
@@ -117,6 +116,8 @@ def process_spectrum(spectrum: MsmsSpectrum, is_library: bool) -> MsmsSpectrum:
     spectrum.is_processed = True
 
     return spectrum
+
+
 
 
 @functools.lru_cache(maxsize=None)
@@ -163,7 +164,7 @@ def hash_idx(bin_idx: int, hash_len: int) -> int:
     return mmh3.hash(str(bin_idx), 42, signed=False) % hash_len
 
 
-def spectrum_to_vector(spectrum: MsmsSpectrum, min_mz: float, max_mz: float,
+def _spectrum_to_vector(spectrum: MsmsSpectrum, min_mz: float, max_mz: float,
                        bin_size: float, hash_len: int, norm: bool = True,
                        vector: np.ndarray = None) -> np.ndarray:
     """
@@ -212,6 +213,103 @@ def spectrum_to_vector(spectrum: MsmsSpectrum, min_mz: float, max_mz: float,
     if norm:
         vector /= np.linalg.norm(vector)
     return vector
+
+
+def _spec_to_neutral_loss(spectrum: MsmsSpectrum) -> MsmsSpectrum:
+    """
+    Convert a spectrum to a neutral loss spectrum by subtracting the peak m/z
+    values from the precursor m/z.
+
+    Parameters
+    ----------
+    spectrum : sus.MsmsSpectrum
+        The spectrum to be converted to its neutral loss spectrum.
+
+    Returns
+    -------
+    sus.MsmsSpectrum
+        The converted neutral loss spectrum.
+    """
+    # Add ghost peak at 0 m/z to anchor the m/z range after transformation.
+    mz, intensity = np.copy(spectrum.mz), np.copy(spectrum.intensity)
+    mz, intensity = np.insert(mz, 0, [0]), np.insert(intensity, 0, [0])
+    # Create neutral loss peaks and make sure the peaks are in ascending m/z
+    # order.
+    # TODO: This assumes [M+H]x charged ions.
+    adduct_mass = 1.007825
+    neutral_mass = (
+        spectrum.precursor_mz - adduct_mass
+    ) * spectrum.precursor_charge
+    mz, intensity = ((neutral_mass + adduct_mass) - mz)[::-1], intensity[::-1]
+    return MsmsSpectrum(
+        spectrum.identifier,
+        spectrum.precursor_mz,
+        spectrum.precursor_charge,
+        np.ascontiguousarray(mz),
+        np.ascontiguousarray(intensity),
+        spectrum.retention_time,
+    )
+
+def spectrum_to_vector(spectrum: MsmsSpectrum, min_mz: float, max_mz: float,
+                       bin_size: float, hash_len: int,
+                       include_nl: bool = True) -> np.ndarray:
+    """
+    Convert a `Spectrum` to a dense NumPy vector.
+
+    Peaks are first discretized in to mass bins of width `bin_size` between
+    `min_mz` and `max_mz`, after which they are hashed to random hash bins
+    in the final vector.
+
+    Parameters
+    ----------
+    spectrum : Spectrum
+        The `Spectrum` to be converted to a vector.
+    min_mz : float
+        The minimum m/z to include in the vector.
+    max_mz : float
+        The maximum m/z to include in the vector.
+    bin_size : float
+        The bin size in m/z used to divide the m/z range.
+    hash_len : int
+        The length of the hashed vector, None if no hashing is to be done.
+    include_neutral_loss : bool
+        Concatinate the spectrum neutral loss projection.
+    Returns
+    -------
+    np.ndarray
+        The hashed spectrum vector. Optionally concatinated hashed spectrum
+        vector.
+    """
+    if include_nl:
+        vector = np.concatenate((
+            _spectrum_to_vector(
+                        spectrum,
+                        min_mz,
+                        max_mz,
+                        bin_size,
+                        hash_len,
+                        norm=True,
+                    ),
+            _spectrum_to_vector(
+                        _spec_to_neutral_loss(spectrum),
+                        min_mz,
+                        max_mz,
+                        bin_size,
+                        hash_len,
+                        norm=True,
+                    )
+        ))
+    else:
+        vector = _spectrum_to_vector(
+                        spectrum,
+                        min_mz,
+                        max_mz,
+                        bin_size,
+                        hash_len,
+                        norm=True,
+                    )
+    return vector
+
 
 
 class SpectrumSpectrumMatch:

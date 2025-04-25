@@ -8,30 +8,29 @@ import re
 from functools import lru_cache
 from typing import Dict, IO, Iterator, List, Tuple, Union
 
-import h5py
 import joblib
+import lancedb
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import tqdm
 from lxml.etree import LxmlError
 from pyteomics import fasta, mass, mgf, mzml, mzxml, parser
 from spectrum_utils.spectrum import MsmsSpectrum
-from spectrum_utils.fragment_annotation import FragmentAnnotation
 
+from ann_solo import utils
 from ann_solo.config import config
 from ann_solo.decoy_generator import shuffle_and_reposition, _shuffle
 from ann_solo.parsers import SplibParser
 from ann_solo.prosit import get_predictions
-from ann_solo.spectrum import process_spectrum
-
-
+from ann_solo.spectrum import process_spectrum, spectrum_to_vector
 
 class SpectralLibraryReader:
     """
     Read spectra from a spectral library file.
     """
 
-    _supported_extensions = ['.splib','.sptxt','.mgf']
+    _supported_extensions = ['.splib','.sptxt','.mgf', '.fasta']
 
     is_recreated = False
 
@@ -79,7 +78,7 @@ class SpectralLibraryReader:
         config_filename = self._get_config_filename()
         store_filename = self._get_store_filename()
 
-        if not os.path.isfile(config_filename) or not os.path.isfile(store_filename):
+        if not os.path.isfile(config_filename) or not os.path.isdir(store_filename):
             # If not we should recreate this file
             # prior to using the spectral library.
             do_create = True
@@ -109,7 +108,7 @@ class SpectralLibraryReader:
         # Open the Spectral Library Store
         self._spectral_library_store = SpectralLibraryStore(
             self._get_store_filename())
-        self._spectral_library_store.open_store('r')
+        self._spectral_library_store.open_store()
 
     def _get_config_filename(self) -> str:
         """
@@ -139,10 +138,26 @@ class SpectralLibraryReader:
         """
         if self._config_hash is not None:
             return (f'{os.path.splitext(self._filename)[0]}_'
-                    f'{self._config_hash[:7]}.hdf5')
+                    f'{self._config_hash[:7]}')
         else:
-            return f'{os.path.splitext(self._filename)[0]}.hdf5'
+            return f'{os.path.splitext(self._filename)[0]}'
 
+    def _spectrum_to_dict(self, spectrum: MsmsSpectrum) -> dict:
+        """
+        Convert an MsmsSpectrum object into a dictionary representation for
+        bulk insertion.
+        """
+        return {
+            'identifier': spectrum.identifier,
+            'peptide': spectrum.peptide,
+            'precursor_charge': spectrum.precursor_charge,
+            'precursor_mz': spectrum.precursor_mz,
+            'mz': spectrum.mz,
+            'intensity': spectrum.intensity,
+            'annotation': spectrum.annotation,
+            'is_decoy': spectrum.is_decoy,
+            'projection': spectrum.projection
+        }
 
     def _create_config(self) -> None:
         """
@@ -162,25 +177,84 @@ class SpectralLibraryReader:
         # Read all the spectra in the spectral library.
         temp_info = collections.defaultdict(
             lambda: {'id': [], 'precursor_mz': []})
-        with self as lib_reader:
-            with SpectralLibraryStore(self._get_store_filename()) as \
-                    spectra_store:
+        # Block to store all spectra peptides if add_decoys parameter is
+        # set to True
+        target_peptides = set()
+        if config.add_decoys and not self._filename_ext == '.fasta':
+            with self as lib_reader:
+                logging.info(
+                    'Read all target peptides in the library first to avoid '
+                    'similar generated decoys.')
                 for spectrum in tqdm.tqdm(
                         lib_reader.read_library_file(),
                         desc='Library spectra read', unit='spectra'):
-                    if config.add_decoys:
-                        # Store the decoy information for easy retrieval.
-                        decoy_spectrum = shuffle_and_reposition(spectrum)
-                        info_charge = temp_info[decoy_spectrum.precursor_charge]
-                        info_charge['id'].append(decoy_spectrum.identifier)
-                        info_charge['precursor_mz'].append(
-                            decoy_spectrum.precursor_mz)
-                        spectra_store.write_spectrum_to_library(decoy_spectrum)
-                    # Store the spectrum information for easy retrieval.
+                    target_peptides.add(spectrum.peptide)
+        # Process the input library
+        with self as lib_reader:
+            spectra_store = SpectralLibraryStore(self._get_store_filename())
+            spectra_store.open_store("w")
+            batch = []
+            batch_cnt = 0 # For bulk insert
+            for spectrum in tqdm.tqdm(
+                    lib_reader.read_library_file(),
+                    desc='Library spectra read', unit='spectra'):
+                if config.add_decoys and not self._filename_ext == '.fasta':
+                    # Compute decoy
+                    decoy_spectrum = shuffle_and_reposition(spectrum)
+                    if decoy_spectrum and decoy_spectrum.peptide not in \
+                            target_peptides:
+                        # Pre-process the decoy spectrum
+                        decoy_spectrum.is_processed = False
+                        decoy_spectrum = process_spectrum(decoy_spectrum, True)
+                        if decoy_spectrum.is_valid:
+                            info_charge = temp_info[
+                                decoy_spectrum.precursor_charge]
+                            info_charge['id'].append(decoy_spectrum.identifier)
+                            info_charge['precursor_mz'].append(
+                                decoy_spectrum.precursor_mz)
+                            # Get the vector representation
+                            decoy_spectrum.projection = spectrum_to_vector(
+                                decoy_spectrum,
+                                config.min_mz,
+                                config.max_mz,
+                                config.bin_size,
+                                int(config.hash_len / 2)
+                            )
+                            # Append for bulk insert
+                            batch.append(self._spectrum_to_dict(decoy_spectrum))
+                            batch_cnt += 1
+
+                # Pre-process the target spectrum
+                spectrum.is_processed = False
+                spectrum = process_spectrum(spectrum,True)
+                if spectrum.is_valid:
                     info_charge = temp_info[spectrum.precursor_charge]
                     info_charge['id'].append(spectrum.identifier)
                     info_charge['precursor_mz'].append(spectrum.precursor_mz)
-                    spectra_store.write_spectrum_to_library(spectrum)
+                    # Get the vector representation
+                    spectrum.projection = spectrum_to_vector(
+                        spectrum,
+                        config.min_mz,
+                        config.max_mz,
+                        config.bin_size,
+                        int(config.hash_len / 2)
+                    )
+                    # Append for bulk insert
+                    batch.append(self._spectrum_to_dict(spectrum))
+                    batch_cnt += 1
+                # Persist to store every half a million spectra collected
+                if batch_cnt >= 500000:
+                    spectra_store.write_spectra_to_library(batch)
+                    batch = []
+                    batch_cnt = 0
+            if batch:
+                spectra_store.write_spectra_to_library(batch)
+            logging.info(
+                'Create scalar index on charge and identifier for fast '
+                'retrieval from store.')
+            spectra_store.store.create_scalar_index("precursor_charge",
+                                                    index_type="BITMAP")
+            spectra_store.store.create_scalar_index("identifier")
         self.spec_info = {
             'charge': {
                 charge: {
@@ -189,7 +263,6 @@ class SpectralLibraryReader:
                                                np.float32)
                 } for charge, charge_info in temp_info.items()}
         }
-
         # Store the configuration.
         config_filename = self._get_config_filename()
         logging.debug('Save the spectral library configuration to file %s',
@@ -198,6 +271,7 @@ class SpectralLibraryReader:
             (os.path.basename(self._filename), self.spec_info,
              self._config_hash),
             config_filename, compress=9, protocol=pickle.DEFAULT_PROTOCOL)
+
 
     def open(self) -> None:
         self._parser = SplibParser(self._filename.encode())
@@ -240,23 +314,72 @@ class SpectralLibraryReader:
                                                 spec_id)
         spectrum.is_processed = False
         if process_peaks:
-            annotation = spectrum.annotation
             spectrum = process_spectrum(spectrum, True)
-            spectrum._annotation = annotation
+            spectrum._annotation = [None] * len(spectrum.intensity)
+
+
         return spectrum
 
-
-    def read_all_spectra(self) -> Iterator[MsmsSpectrum]:
+    def read_spectra_projections(self, spec_ids: List[str], charge) -> List[
+        np.ndarray]:
         """
-        Traverse all spectra from the spectral library store.
+        Gets a library spectra ids and returns the corresponding spectra
+        projections.
+
+        Parameters
+        ----------
+        spec_ids : List[str]
+            A list of library spectrum ids.
 
         Returns
         -------
-        Iterator[MsmsSpectrum]
-            An iterator of all spectra in the spectral library hdf5 store.
+        List[np.ndarray]
+            List of spectra projections corresponding to the spectra ids passed.
         """
-        for spec_id in self._spectral_library_store.get_all_spectra_ids():
-            yield self.read_spectrum(spec_id)
+        # Fetch queried spectra from the library
+        queried_spectra = \
+            self._spectral_library_store.fetch_projections_in_batch(
+            spec_ids, charge)
+        # Create a temporary dataframe with "id" and "projection" columns
+        # Initialize "projection" with numpy arrays of zeros
+        temp_dataframe = pd.DataFrame({
+            "id": spec_ids
+        })
+        # Assuming queried_spectra is a pandas DataFrame with "identifier" and "projection" columns
+        # Perform a left join to ensure missing identifiers are filled with
+        # zeros and respect the order of ids
+        merged_df = temp_dataframe.merge(
+            queried_spectra.rename(columns={"identifier": "id"}),
+            # Rename to match temp_dataframe
+            on="id",
+            how="left"
+        )
+        # Replace NaN projections with the zero-initialized values
+        zero_vector = np.zeros(config.hash_len, dtype=np.float32)
+        merged_df["projection"] = merged_df["projection"].where(merged_df["projection"].notna(), zero_vector)
+
+        # Return projections as a list of numpy arrays
+        return merged_df["projection"].tolist()
+
+
+    def read_spectra_candidates(self, spec_ids: List[str], charge) -> List[
+        MsmsSpectrum]:
+        """
+        Gets a library spectra ids and returns the corresponding spectra
+        projections.
+
+        Parameters
+        ----------
+        spec_ids : List[str]
+            A list of library spectrum ids.
+
+        Returns
+        -------
+        List[MsmsSpectrum]
+            List of spectra projections corresponding to the spectra ids passed.
+        """
+        return self._spectral_library_store.read_spectra_from_library(
+            spec_ids, charge)
 
 
     def read_library_file(self) -> Iterator[MsmsSpectrum]:
@@ -376,7 +499,7 @@ class SpectralLibraryReader:
 
 
         if mz_intensity_annotation.shape[1] > 2:
-            annotation = [_parse_fragment_annotation(annotation)
+            annotation = [utils._parse_fragment_annotation(annotation)
                           for mz, annotation in
                           zip(mz_intensity_annotation[:, 0].astype(float),
                               mz_intensity_annotation[:, 2].astype(str))]
@@ -452,43 +575,46 @@ class SpectralLibraryStore:
 
         """
         self.file_path = file_path
-        self.hdf5_store = None
+        self.store = None
 
-    def open_store(self,mode: str) -> None:
+    def open_store(self, mode="r") -> None:
         """
-        Open the hdf5 spectral library store for read/write purposes.
-
-        Parameters
-        ----------
-        mode : str
-            The mode (r/w) by which to open the  spectral library store.
+        Create a lance dataset pointer to the spectral library store for read
+        purposes.
         """
-        self.hdf5_store = h5py.File(self.file_path, mode)
-
-    def close_store(self) -> None:
-        """
-        Close the hdf5 spectral library store after read/write is done.
-        """
-        if self.hdf5_store is not None:
-            self.hdf5_store.close()
-            self.hdf5_store = None
+        # Open or create a LanceDB database
+        db = lancedb.connect(self.file_path)
+        if mode == "r":
+            self.store = db.open_table("SpectralLibraryStore")
+        elif mode == "w":
+            schema = pa.schema([
+                pa.field("identifier", pa.string()),
+                pa.field("peptide", pa.string()),
+                pa.field("precursor_charge", pa.int64()),
+                pa.field("precursor_mz", pa.float64()),
+                pa.field("mz", pa.list_(pa.float64())),
+                pa.field("intensity", pa.list_(pa.float32())),
+                pa.field("annotation", pa.list_(pa.string())),
+                pa.field("is_decoy", pa.bool_()),
+                pa.field("projection", pa.list_(pa.float32()))
+            ])
+            self.store = db.create_table("SpectralLibraryStore", schema=schema, mode="overwrite")
 
     def get_all_spectra_ids(self) -> Iterator[str]:
         """
-        Close the hdf5 spectral library store after write/read is done.
+        Retrieves all spectrum identifiers from the spectral library.
 
         Returns
         -------
         Iterator[str]
-            An iterator of the keys/ids of spectra in the library store.
-
+            An iterator yielding the unique identifiers of spectra
+            stored in the library.
         """
-        for spec_id in self.hdf5_store.keys():
-            yield spec_id
+        yield from self.store.to_arrow()["item"].to_pylist()
 
     def write_spectrum_to_library(self, spectrum : MsmsSpectrum) -> None:
         """
-        Gets an Msmsspectrum object, reads attributes, and stores it in the
+        Gets an Msmsspectrum object and stores it in the
         spectral library store for future retrieval.
 
         Parameters
@@ -497,28 +623,21 @@ class SpectralLibraryStore:
             The MsmsSpectrum object.
 
         """
-        # Create a new group under the same key
-        group = self.hdf5_store.create_group(str(spectrum.identifier))
+        # Convert to arrow table
+        spectrum_dict = {
+            'identifier': [str(spectrum.identifier)],
+            'peptide': [spectrum.peptide],
+            'precursor_charge': [spectrum.precursor_charge],
+            'precursor_mz': [spectrum.precursor_mz],
+            'mz': [spectrum.mz],
+            'intensity': [spectrum.intensity],
+            'annotation': [[str(ann) for ann in spectrum.annotation]],
+            'is_decoy': [spectrum.is_decoy],
+            'projection': [spectrum.projection]
 
-        group.create_dataset('peptide', data=spectrum.peptide)
-        group.create_dataset('precursor_charge',
-                             data=spectrum.precursor_charge)
-        group.create_dataset('precursor_mz', data=spectrum.precursor_mz)
-        group.create_dataset('is_decoy', data=spectrum.is_decoy)
-        group.create_dataset('mz', data=spectrum.mz)
-        group.create_dataset('intensity', data=spectrum.intensity)
-        # Encode annotation
-        annotation = np.array([[_encode_ion_type(annotation.ion_type[0]),
-                                0 if annotation.ion_type[0] in 'p' else int(
-                                    annotation.ion_type[1:]),
-                                annotation.charge]
-                             if annotation is not None
-                             else [0, 0, 0]
-                             for annotation in spectrum.annotation])
-
-        group.create_dataset('annotation', data=annotation)
-
-        self.hdf5_store.flush()
+        }
+        # Persist to lance
+        self.store.add(spectrum_dict)
 
     def read_spectrum_from_library(self, spec_id : str)-> MsmsSpectrum:
         """
@@ -535,98 +654,112 @@ class SpectralLibraryStore:
         MsmsSpectrum
             An MsmsSpectrum object.
         """
-        spectrum_specs = self.hdf5_store[str(spec_id)]
-        # Decode annotation
-        annotation = [FragmentAnnotation(_decode_ion_type(annotation[0])+
-                                         str(annotation[1]) if annotation[0] else '',
-                                         charge=annotation[2].astype(int))
-                       if np.count_nonzero(annotation)
-                       else None
-                       for annotation in spectrum_specs['annotation'][()]]
-        spectrum = MsmsSpectrum(str(spec_id),
-                            spectrum_specs['precursor_mz'][()],
-                            spectrum_specs['precursor_charge'][()],
-                            spectrum_specs['mz'][()],
-                            spectrum_specs['intensity'][()])
+        spectrum_specs = self.store.search().where(f"identifier = '{str(spec_id)}'").to_pandas()
 
-        spectrum.peptide = spectrum_specs['peptide'][()].decode('utf-8')
-        spectrum._annotation = annotation
-        spectrum.is_decoy = spectrum_specs['is_decoy'][()]
+        spectrum = MsmsSpectrum(
+            spectrum_specs.identifier.values[0],
+            spectrum_specs.precursor_mz.values[0],
+            spectrum_specs.precursor_charge.values[0],
+            spectrum_specs.mz.values[0],
+            spectrum_specs.intensity.values[0]
+        )
+        spectrum.peptide = spectrum_specs.peptide.values[0]
+        spectrum._annotation = spectrum_specs.annotation.values[0]
+        spectrum.is_decoy = spectrum_specs.is_decoy.values[0]
 
         return spectrum
 
-    def __enter__(self) -> 'SpectralLibraryStore':
-        self.open_store('w')
-        return self
+    # Batch operations
+    def write_spectra_to_library(self, spectra : Dict) -> None:
+        """
+        Stores multiple spectra in the spectral library for future retrieval.
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self.close_store()
+        Parameters
+        ----------
+        spectra: Dict
+            A dictionary containing spectrum data to be stored.
+            The expected structure depends on the database format.
 
-def _parse_fragment_annotation(annotation: str) -> \
-        FragmentAnnotation:
-    """
-    Takes an ion peak anotaion line and parse to retrieve: ion_type,
-    ion_index, and charge.
+        """
+        # Persist to lanceDB
+        self.store.add(spectra)
 
-    Parameters
-    ----------
-    annotation : str
-        Raw annotation line.
+    def read_spectra_from_library(self, spec_ids: List[str], charge: int = None) -> List[
+        MsmsSpectrum]:
+        """
+        Fetches a batch of spectra from the library based on a list of IDs and
+        an optional charge filter, and returns them as a list of MsmsSpectrum objects.
 
-    Returns
-    -------
-    FragmentAnnotation
-        An FragmentAnnotation object.
-    """
-    ion_type = annotation[0]
-    if ion_type in 'abyp':
-        index_charge = annotation[1:].split('/', 1)[0].split('^')
-        ion_index = re.search(r'^\d+', index_charge[0])
-        if len(index_charge) == 1:
-            charge, ion_index = (
-            1 if ion_index.group(0) == index_charge[0] else -1,
-            int(ion_index.group(0)))
-        else:
-            charge = re.search(r'^\d+', index_charge[1])
-            charge, ion_index = int(
-                charge.group(0)) if charge else -1, int(
-                ion_index.group(0)) if ion_index else 1
-        return FragmentAnnotation(str(ion_type)+str(ion_index),
-                                  charge=abs(charge))
-    else:
-        return None
+        Parameters
+        ----------
+        spec_ids : List[str]
+            A list of library spectrum IDs.
+        charge : int, optional
+            An optional charge to filter the spectra. If None, all charges are included.
 
-def _encode_ion_type(ion: str) -> int:
-    """
-    Encode the ion type from the peak's annotation in a spectrum.
+        Returns
+        -------
+        List[MsmsSpectrum]
+            A list of MsmsSpectrum objects corresponding to the provided IDs.
+        """
 
-    Parameters
-    ----------
-    ion : str
-        An ion type: a, b, y or some other character.
-    encoding : int
-        The encoding digit of the ion type based on the map, else return 0.
+        if spec_ids is None or len(spec_ids) == 0:
+            return []
 
-    """
-    ion_type_map = {'a': 1, 'b': 2, 'c': 3, 'x': 4, 'y': 5, 'z': 6, 'I': 7,
-                    'm': 8, 'p': 9, 'r': 10}
-    return ion_type_map.get(ion, 0)
+        # Construct the filter for the query
+        id_filter = ', '.join(f"'{id}'" for id in spec_ids)
+        query = f"identifier in ({id_filter})"
+        if charge is not None:
+            query += f" and precursor_charge = {charge}"
 
-def _decode_ion_type(ion_encoding: int) -> str:
-    """
-    Decode the ion type from the peak's annotation in a spectrum.
+        # Fetch data from the store
+        spectra_data = self.store.search().limit(len(spec_ids)).select(
+            columns=[
+                "identifier", "precursor_mz", "precursor_charge",
+                "mz", "intensity", "peptide", "annotation", "is_decoy"
+            ]).where(query).to_pandas()
 
-    Parameters
-    ----------
-    ion : str
-        An ion type: a, b, y or some other character.
-    encoding : int
-        The encoding digit of the ion type based on the map, else return 0.
+        # Construct and return a list of MsmsSpectrum objects
+        spectra = []
+        for _, row in spectra_data.iterrows():
+            spectrum = MsmsSpectrum(
+                identifier=row["identifier"],
+                precursor_mz=row["precursor_mz"],
+                precursor_charge=row["precursor_charge"],
+                mz=row["mz"],
+                intensity=row["intensity"]
+            )
+            spectrum.peptide = row["peptide"]
+            spectrum._annotation = row["annotation"]
+            spectrum.is_decoy = row["is_decoy"]
+            spectra.append(spectrum)
 
-    """
-    ion_type_reverse_map = {1: 'a', 2: 'b', 3: 'c', 4: 'x', 5: 'y', 6: 'z',
-                            7: 'I', 8: 'm', 9: 'p', 10: 'r'}
-    return ion_type_reverse_map.get(ion_encoding, '_')
+        return spectra
+
+
+    def fetch_projections_in_batch(self, spec_ids: List[str], charge)-> pd:
+        """
+        Fetches the projection vectors for a batch of library spectra based
+        on their identifiers and charge state.
+
+        Parameters
+        ----------
+        spec_ids: List[str]
+            A list of spectrum identifiers to query.
+        charge: int
+            The precursor charge state to filter the spectra.
+
+        Returns
+        -------
+        pd.DataFrame
+            A DataFrame containing the retrieved projections.
+        """
+        filter = ', '.join(f"'{id}'" for id in spec_ids)
+        spectra_projections = self.store.search().limit(len(spec_ids)).select(columns=[
+            "identifier", "projection"]).where(f"precursor_charge = {charge}  and identifier in ({filter})").to_pandas()
+
+        return spectra_projections
+
 
 def verify_extension(supported_extensions: List[str], filename: str) -> None:
     """
@@ -652,8 +785,6 @@ def verify_extension(supported_extensions: List[str], filename: str) -> None:
     elif not os.path.isfile(filename):
         logging.error('File not found: %s', filename)
         raise FileNotFoundError(f'File {filename} does not exist')
-
-
 
 
 def read_mzml(source: Union[IO, str]) -> Iterator[MsmsSpectrum]:
@@ -733,7 +864,7 @@ def _parse_spectrum_mzml(spectrum_dict: Dict) -> MsmsSpectrum:
     elif 'possible charge state' in precursor_ion:
         precursor_charge = int(precursor_ion['possible charge state'])
     else:
-        precursor_charge = None
+        precursor_charge = 0
     spectrum = MsmsSpectrum(str(scan_nr), precursor_mz, precursor_charge,
                             mz_array, intensity_array, None, retention_time)
 
@@ -803,7 +934,7 @@ def _parse_spectrum_mzxml(spectrum_dict: Dict) -> MsmsSpectrum:
     if 'precursorCharge' in spectrum_dict['precursorMz'][0]:
         precursor_charge = spectrum_dict['precursorMz'][0]['precursorCharge']
     else:
-        precursor_charge = None
+        precursor_charge = 0
 
     spectrum = MsmsSpectrum(str(scan_nr), precursor_mz, precursor_charge,
                             mz_array, intensity_array, None, retention_time)
@@ -892,7 +1023,7 @@ def read_mgf(filename: str) -> Iterator[MsmsSpectrum]:
             if 'charge' in mgf_spectrum['params']:
                 precursor_charge = int(mgf_spectrum['params']['charge'][0])
             else:
-                precursor_charge = None
+                precursor_charge = 0
 
             spectrum = MsmsSpectrum(identifier, precursor_mz, precursor_charge,
                                     mgf_spectrum['m/z array'],
@@ -964,7 +1095,20 @@ def read_fasta(filename: str) -> Iterator[MsmsSpectrum]:
             for protein in proteins
         ]
     )
-
+    logging.info(
+        'Number of target peptides identified in  the sequence database is = '
+        '%d',
+        len(_peptides))
+    ## Discard peptides with unknown residues
+    valid_residues = set("KLYAGIEVCMWDPNFRSHQT")
+    _peptides = [
+        peptide for peptide in _peptides if all(p in valid_residues for p in peptide)
+    ]
+    logging.info(
+        'Number of target peptides kept after discarding peptides with '
+        'unknown '
+        'residues is = %d',
+        len(_peptides))
     ## Initialize lists to pass to Prosit
     _peptides_size = len(_peptides)
     peptides = []
@@ -977,43 +1121,57 @@ def read_fasta(filename: str) -> Iterator[MsmsSpectrum]:
             collision_energies.extend([collision_energy] * _peptides_size)
             precursor_charges.extend([precursor_charge] * _peptides_size)
 
-    precursor_mz = [
-        mass.fast_mass(sequence=peptide, ion_type="M",
-                       charge=precursor_charges[i]) for
-        i, peptide in enumerate(peptides)]
-
     ## Generate predictions for target peptides
     for batch_id, target_peptides_batch in enumerate(get_predictions(
                             peptides, precursor_charges, collision_energies)):
         offset = batch_id * config.prosit_batch_size
         for idx, intensities in enumerate(target_peptides_batch['intensities']):
             spectrum = MsmsSpectrum(str(offset + idx),
-                                    precursor_mz[offset + idx],
-                                    precursor_charges[offset + idx],
+                                    mass.fast_mass(sequence=target_peptides_batch['peptide_sequences'][idx],
+                                                   ion_type="M",
+                                                   charge=target_peptides_batch['precursor_charges'][idx]),
+                                    target_peptides_batch['precursor_charges'][idx],
                                     target_peptides_batch['mz'][idx],
                                     intensities)
 
-            spectrum.peptide = peptides[offset + idx]
-            spectrum._annotation = [_parse_fragment_annotation(
+            spectrum.peptide = target_peptides_batch['peptide_sequences'][idx]
+            spectrum._annotation = [utils._parse_fragment_annotation(
                 annotation.decode('utf-8')) for annotation in
                 target_peptides_batch['annotation'][idx]]
             spectrum.is_decoy = False
             yield spectrum
 
     ## Generate predictions for decoy peptides
-    peptides = [_shuffle(peptide)[0] for peptide in peptides]
+    decoy_peptides, decoy_precursor_charges, decoy_collision_energies = [], [], []
+    target_peptides = set(peptides) # Set for O(1) of check of existing target peptide
+    for peptide, charge, col_energie in zip(peptides, precursor_charges, collision_energies):
+        decoy_peptide = _shuffle(peptide)[0]
+        if decoy_peptide and decoy_peptide not in target_peptides:
+            decoy_peptides.append(decoy_peptide)
+            decoy_precursor_charges.append(charge)
+            decoy_collision_energies.append(col_energie)
+
     for batch_id, decoy_peptides_batch in enumerate(get_predictions(
-                            peptides, precursor_charges, collision_energies), True):
+                            decoy_peptides, decoy_precursor_charges, decoy_collision_energies, True)):
         offset = batch_id * config.prosit_batch_size
         for idx, intensities in enumerate(decoy_peptides_batch['intensities']):
             spectrum = MsmsSpectrum('DECOY_' + str(offset + idx),
-                                    precursor_mz[offset + idx],
-                                    precursor_charges[offset + idx],
+                                    mass.fast_mass(sequence=
+                                                   decoy_peptides_batch[
+                                                       'peptide_sequences'][
+                                                       idx],
+                                                   ion_type="M",
+                                                   charge=
+                                                   decoy_peptides_batch[
+                                                       'precursor_charges'][
+                                                       idx]),
+                                    decoy_peptides_batch['precursor_charges'][
+                                        idx],
                                     decoy_peptides_batch['mz'][idx],
                                     intensities)
 
-            spectrum.peptide = peptides[offset + idx]
-            spectrum._annotation = [_parse_fragment_annotation(
+            spectrum.peptide = decoy_peptides_batch['peptide_sequences'][idx]
+            spectrum._annotation = [utils._parse_fragment_annotation(
                 annotation.decode('utf-8')) for annotation in
                 decoy_peptides_batch['annotation'][idx]]
             spectrum.is_decoy = True

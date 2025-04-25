@@ -3,7 +3,6 @@ import textwrap
 
 import configargparse
 
-
 class NewlineTextHelpFormatter(argparse.HelpFormatter):
 
     def _fill_text(self, text, width, indent):

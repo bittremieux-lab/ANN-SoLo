@@ -120,8 +120,10 @@ def original_spectrum():
         ]
     )
 
-    return MsmsSpectrum("YYVC[Carbamidomethyl]TAPHC[Carbamidomethyl]GHR",
-                                380.918862288762, 4, mz, intensity)
+    spectrum = MsmsSpectrum("1", 380.918862288762, 4, mz, intensity)
+    spectrum.peptide = "YYVC[Carbamidomethyl]TAPHC[Carbamidomethyl]GHR"
+
+    return spectrum
 
 @pytest.fixture
 def expected_decoy_spectrum():
@@ -234,8 +236,10 @@ def expected_decoy_spectrum():
         ]
     )
 
-    return MsmsSpectrum("HAHC[Carbamidomethyl]VTPGC[Carbamidomethyl]YYR",
-                                380.918862288762, 4, mz, intensity)
+    spectrum = MsmsSpectrum("1", 380.918862288762, 4, mz, intensity)
+    spectrum.peptide = "HAHC[Carbamidomethyl]VTPGC[Carbamidomethyl]YYR"
+
+    return spectrum
 
 def test_shuffle_and_reposition(original_spectrum, expected_decoy_spectrum):
     # Get decoy

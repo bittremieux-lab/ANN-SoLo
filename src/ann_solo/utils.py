@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Dict, Iterator, List, Optional, Union
 
 import mokapot
@@ -16,9 +17,9 @@ from sklearn.preprocessing import StandardScaler
 from spectrum_utils.utils import mass_diff
 
 from ann_solo import spectrum_similarity as sim
-from ann_solo.spectrum import SpectrumSpectrumMatch
 from ann_solo.config import config
-
+from ann_solo.spectrum import SpectrumSpectrumMatch, MsmsSpectrum
+from spectrum_utils.fragment_annotation import FragmentAnnotation
 
 class CorrelationThreshold(SelectorMixin, BaseEstimator):
     """
@@ -455,3 +456,38 @@ def _compute_ssm_features(
         features["ruzicka"].append(sim_calc.ruzicka())
         features["is_target"].append(not ssm.is_decoy)
     return features
+
+
+def _parse_fragment_annotation(annotation: str) -> \
+        FragmentAnnotation:
+    """
+    Takes an ion peak anotaion line and parse to retrieve: ion_type,
+    ion_index, and charge.
+
+    Parameters
+    ----------
+    annotation : str
+        Raw annotation line.
+
+    Returns
+    -------
+    FragmentAnnotation
+        An FragmentAnnotation object.
+    """
+    ion_type = annotation[0]
+    if ion_type in 'abyp':
+        index_charge = annotation[1:].split('/', 1)[0].split('^')
+        ion_index = re.search(r'^\d+', index_charge[0])
+        if len(index_charge) == 1:
+            charge, ion_index = (
+            1 if ion_index.group(0) == index_charge[0] else -1,
+            int(ion_index.group(0)))
+        else:
+            charge = re.search(r'^\d+', index_charge[1])
+            charge, ion_index = int(
+                charge.group(0)) if charge else -1, int(
+                ion_index.group(0)) if ion_index else 1
+        return FragmentAnnotation(str(ion_type)+str(ion_index),
+                                  charge=abs(charge))
+    else:
+        return None

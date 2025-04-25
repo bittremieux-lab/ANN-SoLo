@@ -1,11 +1,52 @@
-from difflib import ndiff
 from typing import List, Tuple, Dict
 
 import numpy as np
+from numba import njit
 from spectrum_utils import fragment_annotation, proforma
 from spectrum_utils.spectrum import MsmsSpectrum
 
 from ann_solo.config import config
+
+@njit
+def _get_similarity(target: str, decoy: str) -> float:
+    """
+    Computes the similarity between two peptide sequences using 
+    the edit distance based on a dynamic programming approach.
+    Parameters
+    ----------
+    target: str
+        The first string (reference string).
+    decoy: str
+        The second string (comparison string).
+
+    Returns
+    -------
+    float
+        A similarity score between 0 and 1, where 1 indicates identical strings
+        and 0 indicates completely different strings.
+    """
+    m, n = len(target), len(decoy)
+
+    # Init for dynamic programming
+    previous_row = np.arange(n + 1, dtype=np.int32)
+    current_row = np.zeros(n + 1, dtype=np.int32)
+
+    for i in range(1, m + 1):
+        current_row[0] = i
+        for j in range(1, n + 1):
+            if target[i - 1] == decoy[j - 1]:
+                current_row[j] = previous_row[j - 1]
+            else:
+                current_row[j] = 1 + min(previous_row[j],    # Deletion
+                                         current_row[j - 1], # Insertion
+                                         previous_row[j - 1]) # Substitution
+        previous_row, current_row = current_row, previous_row
+
+    # Get the edit distance and compute similarity
+    edit_distance = previous_row[n]
+    max_length = max(m, n)
+
+    return 1 - (edit_distance / max_length) if max_length > 0 else 1.0
 
 def _shuffle(peptide_sequence: str, excluded_residues: List[str] =['K', 'R', 'P'],
              max_similarity: float = 0.7) -> Tuple[str, Dict[int, int]]:
@@ -43,6 +84,7 @@ def _shuffle(peptide_sequence: str, excluded_residues: List[str] =['K', 'R', 'P'
             [i for i in range(len(seq_shuffled)) if
              i not in indices_to_exclude])
         random_permutation = random_permutation.tolist()
+
         full_permutation = [
             random_permutation.pop(0) if i not in indices_to_exclude else i for
             i in range(len(seq_shuffled))]
@@ -50,19 +92,21 @@ def _shuffle(peptide_sequence: str, excluded_residues: List[str] =['K', 'R', 'P'
         seq_shuffled = seq_shuffled[full_permutation]
         # Compute the similarity between seq_shuffled and seq_original using
         #  edit distance
-        edit_distance = sum(
-            1 for x in ndiff(seq_shuffled.tolist(), seq_original) if
-            x[0] != ' ')
-        similarity = 1 - (edit_distance / len(seq_original))
+        similarity = _get_similarity(''.join(seq_original), ''.join(seq_shuffled))
         # Check if similarity is below the specified threshold
         if similarity <= max_similarity:
             return ''.join(seq_shuffled), {full_permutation[i]:i  for i in
                                            range(len(seq_original))}
-        elif similarity < best_similarity:
+        elif similarity <= best_similarity:
             best_similarity, best_shuffled, best_permutation = similarity, ''.join(
                 seq_shuffled), full_permutation
+
+    if  best_similarity > max_similarity:
+        best_shuffled = None
+		
     return best_shuffled, {best_permutation[i]:i  for i in
                            range(len(seq_original))}
+
 
 def _decoy_seq_to_proforma(decoy_spectrum: MsmsSpectrum) -> str:
     """
@@ -104,14 +148,22 @@ def shuffle_and_reposition(spectrum: MsmsSpectrum) -> MsmsSpectrum:
         Decoy spectrum.
     """
     # annotate original spectrum
-    spectrum.annotate_proforma(spectrum.peptide, config.fragment_mz_tolerance,
-                               config.fragment_tol_mode, "abpy",
-                               neutral_losses=True)
+    spectrum.annotate_proforma(
+        spectrum.peptide,
+        config.fragment_mz_tolerance,
+        config.fragment_tol_mode,
+        "abpy",
+        neutral_losses=True
+    )
+
     # parse original spectrum
     parsed_sequence = proforma.parse(spectrum.proforma)
     shuffled_sequence, shuffled_sequence_mapping = _shuffle(
         parsed_sequence[0].sequence)
-
+	# If decoy peptide is same, no decoy generation	
+    if shuffled_sequence is None:
+        return None
+		
     # Compute theoretical fragment m/z of the original peptide
     genuine_peptide_theoretical_fragments = {
     str(ion.ion_type) + '^' + str(ion.charge): mz for ion, mz in

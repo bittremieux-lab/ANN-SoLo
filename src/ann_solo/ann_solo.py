@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from typing import List, Union
 
@@ -71,6 +72,11 @@ def main(args: Union[str, List[str]] = None) -> int:
     logging.getLogger('mokapot').setLevel(logging.WARNING)
     logging.getLogger('numba').setLevel(logging.WARNING)
     logging.getLogger('numexpr').setLevel(logging.WARNING)
+
+    # Lance spilling config
+    # Note that the LANCE_BYPASS_SPILLING environment variable can be used to
+    # bypass spilling to disk. Setting this to true can avoid memory exhaustion issues.
+    os.environ["LANCE_BYPASS_SPILLING"] = "true"
 
     # Load the configuration.
     config.parse(args)
