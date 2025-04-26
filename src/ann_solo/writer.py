@@ -74,7 +74,7 @@ def write_mztab(identifications: List[SpectrumSpectrumMatch], filename: str,
                         f'"{os.path.split(config.query_filename)[1]}" against '
                         f'spectral library file '
                         f'"{os.path.split(config.spectral_library_filename)[1]}"'),
-        ('software[1]', f'[MS, MS:1001456, ANN-SoLo, {__version__}]'),
+        ('software[1]', f'[MS, MS:1003357, ANN-SoLo, {__version__}]'),
         ('psm_search_engine_score[1]', '[MS, MS:1001143, search engine '
                                        'specific score for PSMs,]'),
         ('psm_search_engine_score[2]', '[MS, MS:1002354, PSM-level q-value,]'),
@@ -134,7 +134,7 @@ def write_mztab(identifications: List[SpectrumSpectrumMatch], filename: str,
                 pathlib.Path(os.path.abspath(
                     config.spectral_library_filename)).as_uri(),
                 database_version,
-                '[MS, MS:1001456, ANN SoLo,]',
+                '[MS, MS:1003357, ANN SoLo,]',
                 str(ssm.search_engine_score),
                 str(ssm.q),
                 'null',
